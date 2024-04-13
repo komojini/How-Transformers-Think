@@ -1,19 +1,63 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
-import math
-import inspect
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
+import math
+
+from model import GPTConfig, MLP
+
+"""
+B: batch_size
+T: num_tokens
+C: n_embd (n_embd = n_head * n_embd_head)
+
+Reference: https://trevormcguire.medium.com/attention-transformers-and-gpt-b3adbbb4a950
+"""
+
+_PRINTED_KEYS = {}
+
+def print_once(key, value):
+    if key not in _PRINTED_KEYS:
+        print(f"\n{key}: {value}\n")
+        _PRINTED_KEYS[key] = True
+
+def manual_attention(q, k, v, mask=None, dropout=None):
+    """
+    Args:
+        q, k, v: (B, nh, T, hs)
+        mask: (_, _, T, T) or None
+        dropout: callable or None
+    """
+    attention_score = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, hC) x (B, nh, hC, T) -> (B, nh, T, T)
+    """
+    해석:
+        1개의 head 에서 벌어지는 일들을 보겠음
+        q = (T, hC), k.T = (hC, T)
+        T 개의 토큰 q_1 ~ q_T 와 k_1 ~ k_T (여기서 hC 길이의 feature vector 를 그냥 토큰이라고 표현)
+        
+        |q_1 @ k_1, q_1 @ k_2, ..., ...      |
+        |q_2 @ k_1, q_2 @ k_2, ..., ...      |
+        |...      , ...      , ..., ...      |
+        |...      , ...      , ..., q_T @ k_T| 
+
+        causal mask 를 적용하면 아래와 같이 됨
+        |q_1 @ k_1, 0, ...        , 0        |
+        |q_2 @ k_1, q_2 @ k_2, ..., 0        |
+        |...      , ...      , ..., ...      |
+        |...      , ...      , ..., q_T @ k_T|
+
+    느낌해석:
+        각 토큰끼리의 q 와 k 의 feature vector의 유사도 계산해서 attention score 계산
+    """
+
+    if mask is not None:
+        attention_score = attention_score.masked_fill(mask == 0, float('-inf'))
+
+    print_once("attention_score.shape", attention_score.shape)
+    attention_score = F.softmax(attention_score, dim=-1) # -> (B, nh, T, T # sum=1)
+    
+    if dropout is not None:
+        attention_score = dropout(attention_score)
+    return attention_score @ v # (B, nh, T, T # sum=1) x (B, nh, T, hC) -> (B, nh, T, hC)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -24,7 +68,12 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        return F.layer_norm(input, 
+                            normalized_shape=self.weight.shape,
+                            weight=self.weight, 
+                            bias=self.bias, 
+                            eps=1e-5)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -42,23 +91,24 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = False # hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size), persistent=False)
 
     def forward(self, x):
         """
         Args:
             x: (B, T, C) input tensor
+                - Each feature vector is normalized.
         Returns:
             y: (B, T, C) output tensor
         """
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size() 
 
-        x = self.c_attn(x) # (B, T, 3 * C)
+        x = self.c_attn(x) # -> (B, T, 3 * C)
         """
         calculate query, key, values for all heads in batch
 
@@ -66,7 +116,7 @@ class CausalSelfAttention(nn.Module):
         """
 
         # separate out q, k, v, and reshape them for all heads
-        q, k, v  = x.split(self.n_embd, dim=2) # -> (B, T, C) x 3
+        q, k, v  = x.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -80,32 +130,22 @@ class CausalSelfAttention(nn.Module):
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
+            print_once("att", att[0][0])
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            # y = manual_attention(q, k, v, mask=self.bias[:,:,:T,:T], dropout=self.attn_dropout)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+
+        print_once("causal_self_attention_output.shape", y.shape)
         return y
 
-class MLP(nn.Module):
 
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class Block(nn.Module):
-
+class DecoderBlock(nn.Module):
+    """"""
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -114,35 +154,39 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        """
+        In layernorms, each "feature vector" is normalized.
+        - which means that the 1 mean and 1 variance are calculated by 1 feature vector (C).
+
+        Args:
+            x: input tensor of shape (B, T, C)
+        Returns:
+            tensor of shape (B, T, C)
+        """
+        x = self.ln_1(x)
+        x = x + self.attn(x) # -> (B, T, C)
+
+        x = self.ln_2(x)
+        x = x + self.mlp(x) # -> (B, T, C)
         return x
+    
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+class GPT_Anatomy(nn.Module):
+    """
 
-class GPT(nn.Module):
-
+    Image: https://i.stack.imgur.com/DbokL.png
+    """
     def __init__(self, config):
         super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
         self.config = config
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -182,16 +226,25 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        batch_size, num_tokens = idx.size()
+        """
+        T: num_tokens
+        B: batch_size
+        C: n_embd
+        """
+        assert num_tokens <= self.config.block_size, f"Cannot forward sequence of length {num_tokens}, block size is only {self.config.block_size}"
+        
+        pos = torch.arange(0, num_tokens, dtype=torch.long, device=device) # shape (T)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, C)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, C)
+
         x = self.transformer.drop(tok_emb + pos_emb)
+
         for block in self.transformer.h:
             x = block(x)
+        
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -204,17 +257,6 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
-
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -232,6 +274,7 @@ class GPT(nn.Module):
             'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
         }[model_type]
+
         print("forcing vocab_size=50257, block_size=1024, bias=True")
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
@@ -242,78 +285,38 @@ class GPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        model = GPT_Anatomy(config)
+        state_dict = model.state_dict()
+        state_dict_keys = state_dict.keys()
+        state_dict_keys = [k for k in state_dict_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+        state_dict_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = state_dict_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        assert len(sd_keys_hf) == len(state_dict_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(state_dict_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
+                assert state_dict_hf[k].shape[::-1] == state_dict[k].shape
                 with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
+                    state_dict[k].copy_(state_dict_hf[k].t())
             else:
                 # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
+                assert state_dict_hf[k].shape == state_dict[k].shape
                 with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+                    state_dict[k].copy_(state_dict_hf[k])
 
+        print("loaded successfully")
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
